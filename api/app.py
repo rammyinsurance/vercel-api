@@ -1,3 +1,4 @@
+# api/index.py  (Vercel auto-serves /api)
 import os
 import base64
 import datetime as dt
@@ -11,24 +12,26 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
 
+# ================== CONFIG (use env on Vercel) ==================
+API_KEY = os.getenv("ANGEL_API_KEY", "").strip() or "16l7qomQ"
+USERNAME = os.getenv("ANGEL_USERNAME", "").strip() or "SNBM1003"
+PASSWORD = os.getenv("ANGEL_PASSWORD", "").strip() or "9043"
+TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "").strip() or "G64WUKEIQHKBKNZKE4C4RKYS5U"
+SCRIP_MASTER_URL = os.getenv(
+    "SCRIP_MASTER_URL",
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+).strip()
+# ===============================================================
 
-# ================== CONFIG ==================
-API_KEY = "16l7qomQ"
-USERNAME = "SNBM1003"
-PASSWORD = "9043"
-TOTP_SECRET = "G64WUKEIQHKBKNZKE4C4RKYS5U"
-SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-# ============================================
-
-# NSE index tokens (per Angel forums/docs)
+# NSE index tokens (per Angel docs/forums)
 INDEX_TOKENS = {
     "NIFTY": "26000",
     "BANKNIFTY": "26009",
-    "FINNIFTY": "26037",      # commonly used token
-    "MIDCPNIFTY": "26074",    # commonly used token
+    "FINNIFTY": "26037",
+    "MIDCPNIFTY": "26074",
 }
 
-# Exact index trading symbols Angel may expect in ltpData
+# Display names SmartAPI expects for NSE indices
 INDEX_TRADING_SYMBOL = {
     "NIFTY": "NIFTY 50",
     "BANKNIFTY": "NIFTY BANK",
@@ -36,23 +39,10 @@ INDEX_TRADING_SYMBOL = {
     "MIDCPNIFTY": "NIFTY MIDCAP SELECT",
 }
 
-# Absolute imports (ensure 'api' is the package, not a directory)
-from api.instruments import (
-    compute_index_expiries,
-    refresh_cache,
-    get_fetch_env_info,
-)
-from api.config import (
-    DEFAULT_INDEX_UNDERLYINGS,
-    DEFAULT_EXCHANGES,
-    DEFAULT_INCLUDE_EXPIRED,
-)
-
-# Correct Flask initialization (was: Flask(**name**))
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"])
 
-
-# ---- Session/cache ----
+# ---- Session/cache (persists per lambda instance) ----
 _sc: Optional[SmartConnect] = None
 _sc_time: Optional[dt.datetime] = None
 _jwt: Optional[str] = None
@@ -71,8 +61,10 @@ def _sanitize_totp(raw: str) -> str:
     base64.b32decode(cleaned + "=" * pad, casefold=True)  # raises if invalid
     return cleaned
 
+
 def _format_expiry(d: dt.date) -> str:
     return d.strftime("%d%b%Y").upper()  # DDMMMYYYY
+
 
 def _parse_expiry(s: str) -> dt.date:
     try:
@@ -80,9 +72,11 @@ def _parse_expiry(s: str) -> dt.date:
     except Exception:
         raise ValueError("Expiry must be DDMMMYYYY, e.g. 28AUG2025")
 
+
 def _extract_option_type(sym: str) -> Optional[str]:
     s = str(sym).upper()
     return "CE" if s.endswith("CE") else ("PE" if s.endswith("PE") else None)
+
 
 def _human_strike(x):
     try:
@@ -91,11 +85,13 @@ def _human_strike(x):
     except Exception:
         return x
 
+
 def _fnum(x):
     try:
         return float(x)
     except Exception:
         return None
+
 
 def _inum(x):
     try:
@@ -103,16 +99,29 @@ def _inum(x):
     except Exception:
         return None
 
+
 def _pick(d: Dict[str, Any], *keys):
     for k in keys:
         if d.get(k) is not None:
             return d[k]
     return None
 
-# ---------- Login & Scrip Master ----------
+
+# ---------- Login & headers ----------
 def login(force: bool = False) -> SmartConnect:
     """Login (or reuse) SmartAPI session and capture JWT + feed token."""
     global _sc, _sc_time, _jwt, _feed_token
+
+    # Helpful error if env is missing in Vercel
+    missing = [n for n, v in {
+        "ANGEL_API_KEY": API_KEY,
+        "ANGEL_USERNAME": USERNAME,
+        "ANGEL_PASSWORD": PASSWORD,
+        "ANGEL_TOTP_SECRET": TOTP_SECRET,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing required environment variable(s): {', '.join(missing)}")
+
     if (
         not force
         and _sc is not None
@@ -120,6 +129,7 @@ def login(force: bool = False) -> SmartConnect:
         and (dt.datetime.utcnow() - _sc_time).total_seconds() < 8.5 * 3600
     ):
         return _sc
+
     secret = _sanitize_totp(TOTP_SECRET)
     otp = pyotp.TOTP(secret).now()
     sc = SmartConnect(api_key=API_KEY)
@@ -129,8 +139,9 @@ def login(force: bool = False) -> SmartConnect:
     _sc, _sc_time = sc, dt.datetime.utcnow()
     return _sc
 
+
 def _headers_marketdata() -> Dict[str, str]:
-    """Headers Angel expects for REST /market/v1/quote (Market Data API)."""
+    """Headers for REST /market/v1/quote."""
     return {
         "Authorization": f"Bearer {_jwt}",
         "x-api-key": API_KEY,
@@ -145,20 +156,30 @@ def _headers_marketdata() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+
+# ---------- Scrip Master (no pandas) ----------
 def _to_date_safe(value) -> Optional[dt.date]:
-    """Convert incoming 'expiry' (commonly ISO string) to date; else None."""
+    """Convert Angel 'expiry' formats to date; else None."""
     if value in (None, "", "NaT"):
         return None
     s = str(value).strip()
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+    fmts = [
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d-%b-%Y",
+        "%d%b%Y",
+        "%d-%b-%y",
+    ]
+    for fmt in fmts:
         try:
             return dt.datetime.strptime(s[:len(fmt)], fmt).date()
         except Exception:
             pass
     return None
 
+
 def load_scrip_master(force: bool = False) -> List[Dict[str, Any]]:
-    """Returns a list of normalized rows; caches for 6 hours."""
+    """Fetch & normalize Scrip Master; cache 6h."""
     global _scrip_rows, _scrip_time
     now = dt.datetime.utcnow()
     if (
@@ -169,25 +190,38 @@ def load_scrip_master(force: bool = False) -> List[Dict[str, Any]]:
     ):
         return _scrip_rows
 
-    r = requests.get(SCRIP_MASTER_URL, timeout=60)
-    r.raise_for_status()
-    raw = r.json()  # list[dict]
+    resp = requests.get(SCRIP_MASTER_URL, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    # If wrapped (e.g., {"data":[...]}), unwrap
+    if isinstance(payload, dict):
+        for key in ("data", "rows", "result"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+
+    if not isinstance(payload, list):
+        _scrip_rows, _scrip_time = [], now
+        return _scrip_rows
 
     norm: List[Dict[str, Any]] = []
-    for row in raw:
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
         exch = str(row.get("exch_seg", "")).strip().upper()
         inst = str(row.get("instrumenttype", "")).strip().upper()
         name = str(row.get("name", "")).strip().upper()
         symbol = str(row.get("symbol", "")).strip().upper()
         expiry = _to_date_safe(row.get("expiry"))
         strike = None
-        try:
-            if row.get("strike") is not None:
+        if "strike" in row and row.get("strike") not in (None, "", "NaN"):
+            try:
                 strike = _human_strike(float(row.get("strike")))
-        except Exception:
-            pass
+            except Exception:
+                strike = None
         token = row.get("token")
-        if token is None:
+        if token in (None, "", "NaN"):
             continue
         norm.append({
             "exch_seg": exch,
@@ -205,21 +239,29 @@ def load_scrip_master(force: bool = False) -> List[Dict[str, Any]]:
 
 # ---------- Expiries ----------
 def list_expiries(index_name: str, instrumenttype: str = "OPTIDX") -> List[str]:
-    df = load_scrip_master()
+    rows = load_scrip_master()
     today = dt.date.today()
-    mask = (
-        (df["name"] == index_name.upper())
-        & (df["exch_seg"] == "NFO")
-        & (df["instrumenttype"] == instrumenttype.upper())
-        & df["expiry"].notna()
-        & (df["expiry"] >= today)
-    )
-    exps = sorted(set(df.loc[mask, "expiry"]))
-    return [_format_expiry(e) for e in exps]
+    exp_set: set[dt.date] = set()
+    idx = (index_name or "").upper()
+    inst = (instrumenttype or "").upper()
+
+    for r in rows:
+        if (
+            r.get("name") == idx
+            and r.get("exch_seg") == "NFO"
+            and r.get("instrumenttype") == inst
+            and isinstance(r.get("expiry"), dt.date)
+            and r["expiry"] >= today
+        ):
+            exp_set.add(r["expiry"])
+
+    return [_format_expiry(e) for e in sorted(exp_set)]
+
 
 # ---------- Strike window selection ----------
 def _nearest_index(values: List[float], x: float) -> int:
     return min(range(len(values)), key=lambda i: abs(values[i] - x))
+
 
 def _select_window_strikes(strikes_sorted: List[float], center_val: float, half_width: int = 10) -> List[float]:
     if not strikes_sorted:
@@ -229,8 +271,9 @@ def _select_window_strikes(strikes_sorted: List[float], center_val: float, half_
     hi = min(len(strikes_sorted), i + half_width + 1)
     return strikes_sorted[lo:hi]
 
+
 def _fast_spot(index_name: str) -> Optional[float]:
-    """Quick SDK spot (may fail) using exact Angel display name + token."""
+    """Quick SDK spot using Angel display name + token."""
     sc = login()
     tok = INDEX_TOKENS.get(index_name.upper())
     if not tok:
@@ -242,6 +285,7 @@ def _fast_spot(index_name: str) -> Optional[float]:
         return _fnum(_pick(d, "ltp", "lastPrice", "lastTradedPrice"))
     except Exception:
         return None
+
 
 # ---------- Market data via SDK & REST ----------
 def fetch_full_marketdata(tokens: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
@@ -270,6 +314,7 @@ def fetch_full_marketdata(tokens: List[str]) -> Dict[str, Dict[str, Optional[flo
             out[tok] = {"ltp": ltp, "volume": vol, "oi": oi, "underlying": und}
     return out
 
+
 def fetch_quote_single(tradingsymbol: str, token: str) -> Dict[str, Optional[float]]:
     sc = login()
     try:
@@ -283,12 +328,10 @@ def fetch_quote_single(tradingsymbol: str, token: str) -> Dict[str, Optional[flo
     und = _fnum(_pick(data, "underlyingValue", "underlyingSpot"))
     return {"ltp": ltp, "volume": vol, "oi": oi, "underlying": und}
 
+
 def _rest_quote_ltp_nse(tokens: List[str]) -> Optional[float]:
-    """
-    LTP via REST: POST /market/v1/quote with {"mode":"LTP","exchangeTokens":{"NSE":[...]}}
-    Uses JWT + x-api-key + x-client-code + x-feed-token.
-    """
-    login()  # ensure jwt/feed token present
+    """POST /market/v1/quote {mode:LTP, exchangeTokens:{NSE:[...]}} using JWT/x-api-key/x-client-code/x-feed-token."""
+    login()
     if not tokens:
         return None
     url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote"
@@ -306,53 +349,54 @@ def _rest_quote_ltp_nse(tokens: List[str]) -> Optional[float]:
         return None
     return None
 
-# ---------- Chain builder ----------
+
+# ---------- Chain builder (no pandas) ----------
 def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "OPTIDX", half_width: int = 10) -> Dict[str, Any]:
     expiry_date = _parse_expiry(expiry_str)
-    df = load_scrip_master()
 
-    mask = (
-        (df["name"] == index_name.upper())
-        & (df["exch_seg"] == "NFO")
-        & (df["instrumenttype"] == instrumenttype.upper())
-        & (df["expiry"] == expiry_date)
-    )
-    rows_all = df.loc[mask, ["symbol", "strike", "token"]].dropna(subset=["symbol", "token"]).copy()
-    if rows_all.empty:
-        return {
-            "name": index_name.upper(),
-            "instrumenttype": instrumenttype.upper(),
-            "expiry": expiry_str,
-            "spot": None,
-            "rows": [],
+    rows_all = [
+        {
+            "symbol": r["symbol"],
+            "strike": _human_strike(r["strike"]) if r["strike"] is not None else None,
+            "token": r["token"],
+            "option_type": _extract_option_type(r["symbol"]),
         }
+        for r in load_scrip_master()
+        if r.get("name") == index_name.upper()
+        and r.get("exch_seg") == "NFO"
+        and r.get("instrumenttype") == instrumenttype.upper()
+        and r.get("expiry") == expiry_date
+        and r.get("symbol") is not None
+        and r.get("token") is not None
+    ]
 
-    rows_all["option_type"] = rows_all["symbol"].apply(_extract_option_type)
-    rows_all = rows_all.dropna(subset=["option_type"]).copy()
-    rows_all["strike"] = rows_all["strike"].apply(_human_strike)
+    rows_all = [r for r in rows_all if r["option_type"] in ("CE", "PE") and r["strike"] is not None]
+    if not rows_all:
+        return {"name": index_name.upper(), "instrumenttype": instrumenttype.upper(), "expiry": expiry_str, "spot": None, "rows": []}
 
     # pick ATM ± half_width
     spot_hint = _fast_spot(index_name)
-    uniq_strikes = sorted(set(float(s) for s in rows_all["strike"]))
+    uniq_strikes = sorted(set(float(r["strike"]) for r in rows_all))
     center = spot_hint if spot_hint is not None else (uniq_strikes[len(uniq_strikes) // 2] if uniq_strikes else 0.0)
-    win_strikes = _select_window_strikes(uniq_strikes, center, half_width=half_width)
+    win_strikes = set(_select_window_strikes(uniq_strikes, center, half_width=half_width))
 
-    rows = rows_all[rows_all["strike"].astype(float).isin(set(win_strikes))].copy()
-    rows = rows.sort_values(["strike", "option_type"]).reset_index(drop=True)
+    rows = [r for r in rows_all if float(r["strike"]) in win_strikes]
+    rows.sort(key=lambda x: (float(x["strike"]), x["option_type"]))
 
-    tokens = [str(int(float(t))) for t in rows["token"]]
+    tokens = [str(int(float(r["token"]))) for r in rows]
     book = fetch_full_marketdata(tokens)
 
-    # per-symbol fallback if any token missing all three
+    # fallback per symbol if any token missing all three
     for t in tokens:
         rec = book.get(t) or {}
         if rec.get("ltp") is None and rec.get("oi") is None and rec.get("volume") is None:
-            sym = rows.loc[rows["token"].astype(float).astype(int).astype(str) == t, "symbol"].iloc[0]
-            book[t] = fetch_quote_single(sym, t)
+            sym = next((r["symbol"] for r in rows if str(int(float(r["token"]))) == t), None)
+            if sym:
+                book[t] = fetch_quote_single(sym, t)
 
     # spot from underlying, else REST LTP, else hint
     spot_candidates = [v.get("underlying") for v in book.values() if v.get("underlying") is not None]
-    spot = None
+    spot: Optional[float] = None
     if spot_candidates:
         try:
             spot = sum(float(x) for x in spot_candidates) / len(spot_candidates)
@@ -369,12 +413,11 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
 
     # merge CE/PE by strike
     chain_map: Dict[float, Dict[str, Any]] = {}
-    for _, r in rows.iterrows():
+    for r in rows:
         strike = float(r["strike"])
         side = r["option_type"]  # CE/PE
         tok = str(int(float(r["token"])))
         q = book.get(tok) or {}
-
         ltp = _fnum(q.get("ltp"))
         vol = _inum(q.get("volume"))
         oi = _inum(q.get("oi"))
@@ -393,13 +436,7 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
 
     out_rows = [chain_map[k] for k in sorted(chain_map.keys(), key=float)]
     if len(out_rows) > (2 * half_width + 1):
-        keep = set(
-            _select_window_strikes(
-                sorted({r["strike"] for r in out_rows}),
-                spot if spot is not None else center,
-                half_width=half_width,
-            )
-        )
+        keep = set(_select_window_strikes(sorted({r["strike"] for r in out_rows}), spot if spot is not None else center, half_width=half_width))
         out_rows = [r for r in out_rows if r["strike"] in keep]
 
     return {
@@ -410,28 +447,21 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
         "rows": out_rows,
     }
 
+
 # ---------- Robust spot ----------
 def get_spot_price(symbol: str) -> Optional[float]:
-    """
-    Best-effort spot for an index:
-    1) REST LTP via JWT (+ x-api-key/x-client-code/x-feed-token)  ✅ reliable
-    2) SDK getMarketData('LTP') via token
-    3) SDK ltpData('NSE', trading symbol, token)
-    4) SDK getMarketData('FULL')
-    5) Derive from options' underlyingValue
-    """
     login()
     sym = (symbol or "").upper()
     tok = INDEX_TOKENS.get(sym)
     if not tok:
         return None
 
-    # (1) REST first (most reliable per recent API behavior)
+    # (1) REST first
     rest = _rest_quote_ltp_nse([str(tok)])
     if rest is not None:
         return rest
 
-    # (2) SDK: getMarketData LTP
+    # (2) SDK: LTP
     try:
         res = _sc.getMarketData("LTP", {"NSE": [str(tok)]})
         data = (res or {}).get("data") or {}
@@ -443,7 +473,7 @@ def get_spot_price(symbol: str) -> Optional[float]:
     except Exception:
         pass
 
-    # (3) SDK: ltpData with exact index name
+    # (3) SDK: ltpData
     try:
         t_sym = INDEX_TRADING_SYMBOL.get(sym, sym)
         q = _sc.ltpData("NSE", t_sym, str(tok))
@@ -466,96 +496,18 @@ def get_spot_price(symbol: str) -> Optional[float]:
     except Exception:
         pass
 
-    # (5) Derive from options' underlying
-    try:
-        df = load_scrip_master()
-        today = dt.date.today()
-        mask_exp = (
-            (df.get("name", "").str.upper() == sym)
-            & (df.get("exch_seg", "").str.upper() == "NFO")
-            & (df.get("instrumenttype", "").str.upper() == "OPTIDX")
-            & df["expiry"].notna()
-            & (df["expiry"] >= today)
-        )
-        exps = sorted(set(df.loc[mask_exp, "expiry"]))
-        if not exps:
-            return None
-        nearest = exps[0]
-        mask_opt = (
-            (df["name"] == sym)
-            & (df["exch_seg"] == "NFO")
-            & (df["instrumenttype"] == "OPTIDX")
-            & (df["expiry"] == nearest)
-        )
-        subset = df.loc[mask_opt, ["symbol", "token"]].dropna().head(50)
-        tokens = [str(int(float(t))) for t in subset["token"]]
-        book = fetch_full_marketdata(tokens)
-        candidates = [v.get("underlying") for v in book.values() if v.get("underlying") is not None]
-        if candidates:
-            return sum(float(x) for x in candidates) / len(candidates)
-    except Exception:
-        pass
-
     return None
 
+
+# ---------- HTTP ----------
 @app.get("/")
 def home():
     return jsonify(status="ok", message="Hello from Flask on Vercel!")
 
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"}), 200
-
-@app.post("/v1/refresh")
-def refresh():
-    try:
-        refresh_cache()
-        return jsonify({"status": "refreshed"}), 200
-    except Exception as exc:
-        app.logger.exception("refresh failed: %s", exc)
-        return jsonify({"error": "refresh_failed", "detail": str(exc)}), 500
-
-@app.get("/v1/expiries")
-def expiries():
-    underlyings_param = request.args.get("underlyings")
-    if underlyings_param:
-        underlyings = [u.strip().upper() for u in underlyings_param.split(",") if u.strip()]
-    else:
-        underlyings = [u.upper() for u in DEFAULT_INDEX_UNDERLYINGS]
-
-    exchanges_param = request.args.get("exchanges")
-    if exchanges_param:
-        exchanges = [e.strip().upper() for e in exchanges_param.split(",") if e.strip()]
-    else:
-        exchanges = [e.upper() for e in DEFAULT_EXCHANGES]
-
-    include_expired_param = request.args.get("include_expired")
-    if include_expired_param is None:
-        include_expired = DEFAULT_INCLUDE_EXPIRED
-    else:
-        include_expired = include_expired_param.lower() in {"true", "1", "yes", "y"}
-
-    data = compute_index_expiries(
-        underlyings=underlyings,
-        exchanges=exchanges,
-        include_expired=include_expired,
-    )
-    return jsonify(data), 200
-
-@app.get("/v1/expiries/<underlying>")
-def expiries_for_one(underlying: str):
-    underlying_u = underlying.upper()
-    data = compute_index_expiries(underlyings=[underlying_u])
-    return jsonify({
-        "underlying": underlying_u,
-        "fetched_at": data["fetched_at"],
-        "source": data["source"],
-        "expiries": data["expiries"].get(underlying_u, [])
-    }), 200
-
-@app.get("/v1/debug/env")
-def debug_env():
-    return jsonify(get_fetch_env_info()), 200
 
 
 @app.route("/expiry_dates/<index>", methods=["GET"])
@@ -566,6 +518,7 @@ def http_expiries(index):
         return jsonify({"success": True, "index": index.upper(), "instrumenttype": it.upper(), "expiry_dates": dates})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/option_chain", methods=["GET"])
 def http_chain():
@@ -588,6 +541,7 @@ def http_chain():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+
 @app.route("/spot", methods=["GET"])
 def http_spot():
     symbol = request.args.get("symbol")
@@ -598,5 +552,5 @@ def http_spot():
         return jsonify({"success": True, "symbol": symbol.upper(), "spot": float(spot) if spot is not None else None})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-    
-# Vercel will serve the WSGI 'app' automatically.
+
+# NOTE: Do NOT call app.run(); Vercel serves WSGI `app`.

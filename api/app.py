@@ -1,15 +1,16 @@
-from flask import Flask, jsonify, request
+import os
 import base64
 import datetime as dt
 import json
 import re
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import pyotp
 import requests
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
+
 
 # ================== CONFIG ==================
 API_KEY = "16l7qomQ"

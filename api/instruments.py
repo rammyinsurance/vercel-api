@@ -1,4 +1,3 @@
-# instruments.py
 import json
 import os
 import re
@@ -6,13 +5,11 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-
 import certifi
 import requests
 from dateutil import parser as dateparser
 from requests.exceptions import SSLError, ProxyError, ConnectionError, Timeout
-
-from config import INSTRUMENTS_URL, CACHE_TTL
+from api.config import INSTRUMENTS_URL, CACHE_TTL
 
 # --------------- Thread-safe in-memory cache ----------------
 _lock = threading.Lock()
@@ -25,7 +22,7 @@ _cached = {
 CACHE_FILE = Path("cache_OpenAPIScripMaster.json")
 
 # --------------- SSL/Proxy knobs via env --------------------
-CA_BUNDLE_PATH = os.getenv("CA_BUNDLE_PATH")  # e.g., C:\certs\corp-root-bundle.pem
+CA_BUNDLE_PATH = os.getenv("CA_BUNDLE_PATH")  # e.g., C:\\certs\\corp-root-bundle.pem
 INSECURE_SSL   = os.getenv("INSECURE_SSL", "false").lower() == "true"
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 USER_AGENT = os.getenv("USER_AGENT", "angel-expiries/1.0 (+https://github.com/your-org/angel-expiries)")
@@ -39,12 +36,10 @@ def _parse_expiry_date(raw: str):
     if not raw:
         return None
     s = raw.strip()
-
     # Normalize '27MAY2025' => '27 MAY 2025'
     m = re.match(r"^(\d{1,2})([A-Z]{3})(\d{4})$", s)
     if m:
         s = f"{m.group(1)} {m.group(2)} {m.group(3)}"
-
     try:
         dt = dateparser.parse(s, dayfirst=True, fuzzy=True)
         return dt.date().isoformat()
@@ -133,7 +128,6 @@ def get_instruments(force: bool = False):
             and (now - _cached["fetched_at"]) < CACHE_TTL
         ):
             return _cached["data"], _cached["fetched_at"].isoformat()
-
         data = _fetch_instruments()
         _cached["data"] = data
         _cached["fetched_at"] = now
@@ -154,40 +148,31 @@ def compute_index_expiries(
     """
     instruments, fetched_at = get_instruments()
     today_iso = datetime.now().date().isoformat()
-
     groups = defaultdict(set)
-
     for item in instruments:
         try:
             exch = (item.get("exch_seg") or item.get("exchange") or "").upper()
             if exch not in exchanges:
                 continue
-
             inst_type = (item.get("instrumenttype") or "").upper()
             # Options only; OPTIDX is index options (OPTSTK is stock options).
             if not inst_type.startswith("OPT"):
                 continue
-
             # Underlying "name" hosts NIFTY/BANKNIFTY/FINNIFTY/etc. in instrument file.
             underlying = (item.get("name") or "").upper().strip()
             if not underlying:
                 continue
-
             if underlyings and underlying not in underlyings:
                 continue
-
             expiry_raw = (item.get("expiry") or "").strip()
             expiry_iso = _parse_expiry_date(expiry_raw)
             if not expiry_iso:
                 continue
-
             if not include_expired and expiry_iso < today_iso:
                 continue
-
             groups[underlying].add(expiry_iso)
         except Exception:
             continue  # skip malformed rows
-
     return {
         "source": INSTRUMENTS_URL,   # community-known master location
         "fetched_at": fetched_at,

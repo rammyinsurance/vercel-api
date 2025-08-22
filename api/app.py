@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, request
 
-# Use absolute imports from the "api" package (safer on Vercel than relative imports).
+# Absolute imports (ensure 'api' is the package, not a directory)
 from api.instruments import (
     compute_index_expiries,
     refresh_cache,
@@ -12,6 +12,7 @@ from api.config import (
     DEFAULT_INCLUDE_EXPIRED,
 )
 
+# Correct Flask initialization (was: Flask(**name**))
 app = Flask(__name__)
 
 @app.get("/")
@@ -24,35 +25,27 @@ def health():
 
 @app.post("/v1/refresh")
 def refresh():
-    """
-    Trigger a cache refresh. Keep heavy work out of here in serverless;
-    this example is lightweight and returns quickly.
-    """
     try:
         refresh_cache()
         return jsonify({"status": "refreshed"}), 200
     except Exception as exc:
-        # Log the exception (Vercel shows this in function logs)
         app.logger.exception("refresh failed: %s", exc)
         return jsonify({"error": "refresh_failed", "detail": str(exc)}), 500
 
 @app.get("/v1/expiries")
 def expiries():
-    # Underlyings
     underlyings_param = request.args.get("underlyings")
     if underlyings_param:
         underlyings = [u.strip().upper() for u in underlyings_param.split(",") if u.strip()]
     else:
         underlyings = [u.upper() for u in DEFAULT_INDEX_UNDERLYINGS]
 
-    # Exchanges
     exchanges_param = request.args.get("exchanges")
     if exchanges_param:
         exchanges = [e.strip().upper() for e in exchanges_param.split(",") if e.strip()]
     else:
         exchanges = [e.upper() for e in DEFAULT_EXCHANGES]
 
-    # Include expired
     include_expired_param = request.args.get("include_expired")
     if include_expired_param is None:
         include_expired = DEFAULT_INCLUDE_EXPIRED
@@ -66,7 +59,6 @@ def expiries():
     )
     return jsonify(data), 200
 
-# IMPORTANT: Correct Flask variable rule (no HTML entities)
 @app.get("/v1/expiries/<underlying>")
 def expiries_for_one(underlying: str):
     underlying_u = underlying.upper()
@@ -80,11 +72,6 @@ def expiries_for_one(underlying: str):
 
 @app.get("/v1/debug/env")
 def debug_env():
-    """
-    Minimal, safe debug info (no secrets).
-    Helps diagnose SSL/proxy/cert issues.
-    """
     return jsonify(get_fetch_env_info()), 200
 
-# Do NOT call app.run(); Vercel serves the WSGI `app` automatically.
-# Docs: https://vercel.com/docs/functions/runtimes/python
+# Vercel will serve the WSGI 'app' automatically.

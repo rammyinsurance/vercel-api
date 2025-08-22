@@ -1,16 +1,26 @@
-# api/index.py  (Vercel auto-serves at /api)
+# api/index.py  (Vercel auto-serves /api)
 import os
 import base64
 import datetime as dt
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+# --- make logging writable in serverless ---
+try:
+    os.makedirs("/tmp/logs", exist_ok=True)
+    os.chdir("/tmp")
+except Exception:
+    # if it fails, we still continue; SmartApi may fall back to stdout
+    pass
+# ------------------------------------------
 
 import pyotp
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
+
 
 # ================== CONFIG (use env on Vercel) ==================
 API_KEY = os.getenv("ANGEL_API_KEY", "").strip() or "16l7qomQ"

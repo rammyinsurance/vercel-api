@@ -780,6 +780,11 @@ def http_chain():
     count = request.args.get("count", type=int, default=20)  # exact total strikes to return
     width = request.args.get("width", type=int, default=20)  # used only for pre-window sizing
 
+    # Override for SENSEX
+    if symbol and symbol.upper() == "SENSEX" and request.args.get("count") is None:
+        count = 40
+        width = 40
+
     if not symbol or not expiry:
         return jsonify({"success": False, "error": "query params 'symbol' and 'expiry' are required (expiry as DDMMMYYYY)"}), 400
     try:

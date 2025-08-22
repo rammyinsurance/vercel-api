@@ -58,8 +58,9 @@ _sc_time: Optional[dt.datetime] = None
 _jwt: Optional[str] = None
 _feed_token: Optional[str] = None
 
-_scrip_df: Optional[pd.DataFrame] = None
+_scrip_rows: Optional[List[Dict[str, Any]]] = None
 _scrip_time: Optional[dt.datetime] = None
+
 
 # ---------- Helpers ----------
 def _sanitize_totp(raw: str) -> str:
@@ -144,26 +145,63 @@ def _headers_marketdata() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-def load_scrip_master(force: bool = False) -> pd.DataFrame:
-    global _scrip_df, _scrip_time
+def _to_date_safe(value) -> Optional[dt.date]:
+    """Convert incoming 'expiry' (commonly ISO string) to date; else None."""
+    if value in (None, "", "NaT"):
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s[:len(fmt)], fmt).date()
+        except Exception:
+            pass
+    return None
+
+def load_scrip_master(force: bool = False) -> List[Dict[str, Any]]:
+    """Returns a list of normalized rows; caches for 6 hours."""
+    global _scrip_rows, _scrip_time
     now = dt.datetime.utcnow()
     if (
         not force
-        and _scrip_df is not None
+        and _scrip_rows is not None
         and _scrip_time is not None
         and (now - _scrip_time).total_seconds() < 6 * 3600
     ):
-        return _scrip_df
+        return _scrip_rows
+
     r = requests.get(SCRIP_MASTER_URL, timeout=60)
     r.raise_for_status()
-    df = pd.DataFrame(r.json())
-    if "expiry" in df.columns:
-        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
-    for c in ("exch_seg", "instrumenttype", "name", "symbol"):
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip().str.upper()
-    _scrip_df, _scrip_time = df, now
-    return df
+    raw = r.json()  # list[dict]
+
+    norm: List[Dict[str, Any]] = []
+    for row in raw:
+        exch = str(row.get("exch_seg", "")).strip().upper()
+        inst = str(row.get("instrumenttype", "")).strip().upper()
+        name = str(row.get("name", "")).strip().upper()
+        symbol = str(row.get("symbol", "")).strip().upper()
+        expiry = _to_date_safe(row.get("expiry"))
+        strike = None
+        try:
+            if row.get("strike") is not None:
+                strike = _human_strike(float(row.get("strike")))
+        except Exception:
+            pass
+        token = row.get("token")
+        if token is None:
+            continue
+        norm.append({
+            "exch_seg": exch,
+            "instrumenttype": inst,
+            "name": name,
+            "symbol": symbol,
+            "expiry": expiry,
+            "strike": strike,
+            "token": token,
+        })
+
+    _scrip_rows, _scrip_time = norm, now
+    return norm
+
 
 # ---------- Expiries ----------
 def list_expiries(index_name: str, instrumenttype: str = "OPTIDX") -> List[str]:

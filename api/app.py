@@ -1,4 +1,5 @@
 # app.py
+import os
 import base64
 import datetime as dt
 import json
@@ -10,6 +11,19 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
+
+# --- make logging writable in serverless (SmartApi uses logzero -> 'logs/' relative path) ---
+try:
+    os.makedirs("/tmp/logs", exist_ok=True)
+    os.chdir("/tmp")
+    try:
+        from logzero import logfile
+        logfile("/tmp/logs/smartapi.log")
+    except Exception:
+        pass
+except Exception:
+    pass
+# ----
 
 # ================== CONFIG ==================
 API_KEY = "16l7qomQ"

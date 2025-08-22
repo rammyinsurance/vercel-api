@@ -287,10 +287,18 @@ def list_expiries(index_name: str, instrumenttype: str = "OPTIDX") -> List[str]:
 
     return [_format_expiry(e) for e in sorted(exp_set)]
 
-# ---------- Strike window selection ----------
+# ---------- Strike selection ----------
 def _nearest_index(values: List[float], x: float) -> int:
     return min(range(len(values)), key=lambda i: abs(values[i] - x)) if values else 0
 
+def _select_nearest_strikes_k(strikes_sorted: List[float], center_val: float, k: int) -> List[float]:
+    """Return up to k distinct strikes nearest to center, expanding outward."""
+    if not strikes_sorted or k <= 0:
+        return []
+    picked = sorted(strikes_sorted, key=lambda s: (abs(s - center_val), s))[:k]
+    return sorted(set(picked))
+
+# (kept for completeness; no longer used for final trimming)
 def _select_window_strikes(strikes_sorted: List[float], center_val: float, half_width: int = 10) -> List[float]:
     if not strikes_sorted:
         return []
@@ -371,7 +379,7 @@ def _rest_quote_ltp_nse(tokens: List[str]) -> Optional[float]:
         return None
     return None
 
-# ---------- Chain builder (defaults to ±20 strikes) ----------
+# ---------- Chain builder (nearest-K; defaults to ±20) ----------
 def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "OPTIDX", half_width: int = 20) -> Dict[str, Any]:
     expiry_date = _parse_expiry(expiry_str)
     idx = index_name.upper()
@@ -397,7 +405,6 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
         strike = r.get("strike")
 
         if opt_type not in ("CE","PE") or strike is None:
-            # try to parse from symbol if missing
             ps_exp, ps_strike, ps_ot = _parse_symbol_fields(r.get("symbol",""))
             opt_type = opt_type or ps_ot
             strike = strike if strike is not None else ps_strike
@@ -414,11 +421,12 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
     if not rows_all:
         return {"name": idx, "instrumenttype": inst, "expiry": expiry_str, "spot": None, "rows": []}
 
-    # pick ATM ± window
+    # pick up to K nearest distinct strikes (K = 2*half_width + 1)
     spot_hint = _fast_spot(idx)
     uniq_strikes = sorted(set(float(r["strike"]) for r in rows_all))
     center = spot_hint if spot_hint is not None else (uniq_strikes[len(uniq_strikes)//2] if uniq_strikes else 0.0)
-    win_strikes = set(_select_window_strikes(uniq_strikes, center, half_width=half_width))
+    target_k = 2 * half_width + 1
+    win_strikes = set(_select_nearest_strikes_k(uniq_strikes, center, target_k))
 
     rows = [r for r in rows_all if float(r["strike"]) in win_strikes]
     rows.sort(key=lambda x: (float(x["strike"]), x["option_type"]))
@@ -469,9 +477,7 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
         }
 
     out_rows = [chain_map[k] for k in sorted(chain_map.keys(), key=float)]
-    if len(out_rows) > (2*half_width + 1):
-        keep = set(_select_window_strikes(sorted({r["strike"] for r in out_rows}), spot if spot is not None else center, half_width=half_width))
-        out_rows = [r for r in out_rows if r["strike"] in keep]
+    # NOTE: no final trimming; we already selected nearest-K
 
     return {"name": idx, "instrumenttype": inst, "expiry": expiry_str, "spot": float(spot) if spot is not None else None, "rows": out_rows}
 

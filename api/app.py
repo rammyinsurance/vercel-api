@@ -1,4 +1,39 @@
 from flask import Flask, jsonify, request
+import base64
+import datetime as dt
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import pyotp
+import requests
+from flask_cors import CORS
+from SmartApi import SmartConnect
+
+# ================== CONFIG ==================
+API_KEY = "16l7qomQ"
+USERNAME = "SNBM1003"
+PASSWORD = "9043"
+TOTP_SECRET = "G64WUKEIQHKBKNZKE4C4RKYS5U"
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+# ============================================
+
+# NSE index tokens (per Angel forums/docs)
+INDEX_TOKENS = {
+    "NIFTY": "26000",
+    "BANKNIFTY": "26009",
+    "FINNIFTY": "26037",      # commonly used token
+    "MIDCPNIFTY": "26074",    # commonly used token
+}
+
+# Exact index trading symbols Angel may expect in ltpData
+INDEX_TRADING_SYMBOL = {
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "FINNIFTY": "NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NIFTY MIDCAP SELECT",
+}
 
 # Absolute imports (ensure 'api' is the package, not a directory)
 from api.instruments import (

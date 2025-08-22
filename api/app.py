@@ -1,4 +1,4 @@
-# api/index.py  (Vercel auto-serves /api)
+# api/index.py  (Vercel auto-serves at /api)
 import os
 import base64
 import datetime as dt
@@ -6,21 +6,24 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-# --- make logging writable in serverless ---
+# --- make logging writable in serverless (SmartApi uses logzero -> 'logs/' relative path) ---
 try:
     os.makedirs("/tmp/logs", exist_ok=True)
     os.chdir("/tmp")
+    try:
+        from logzero import logfile
+        logfile("/tmp/logs/smartapi.log")
+    except Exception:
+        pass
 except Exception:
-    # if it fails, we still continue; SmartApi may fall back to stdout
     pass
-# ------------------------------------------
+# -------------------------------------------------------------------------------------------
 
 import pyotp
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
-
 
 # ================== CONFIG (use env on Vercel) ==================
 API_KEY = os.getenv("ANGEL_API_KEY", "").strip() or "16l7qomQ"
@@ -92,10 +95,10 @@ def _pick(d: Dict[str, Any], *keys):
 
 # ----- Symbol parsing (handles 2- or 4-digit year & various layouts) -----
 _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-# Examples matched:
-#  NIFTY28AUG24CE, NIFTY28AUG2025CE, NIFTY28AUG24 20000CE, NIFTY28AUG24C20000, ... etc.
+# Examples:
+#  NIFTY28AUG24CE, NIFTY28AUG2025CE, NIFTY28AUG24 20000CE, NIFTY28AUG24C20000
 _EXPIRY_YR2_OR_YR4 = re.compile(r"(\d{1,2})([A-Z]{3})(\d{2,4})")
-_STRIKE_AND_OT_RE   = re.compile(r"(\d{3,6})\s*(CE|PE|C|P)\b")
+_STRIKE_AND_OT_RE  = re.compile(r"(\d{3,6})\s*(CE|PE|C|P)\b")
 
 def _normalize_year(y_txt: str) -> int:
     y = int(y_txt)
@@ -133,24 +136,21 @@ def _parse_symbol_fields(symbol: str) -> Tuple[Optional[dt.date], Optional[float
             except Exception:
                 exp = None
 
-    # option type + strike (try a few layouts)
+    # option type + strike
     ot = None
     strike = None
 
-    # pattern like "... 20000CE" or "...C20000"
-    m2 = _STRIKE_AND_OT_RE.search(s)
+    m2 = _STRIKE_AND_OT_RE.search(s)  # "... 20000CE" or "...C20000"
     if m2:
         strike = _human_strike(m2.group(1))
         ot_raw = m2.group(2)
         ot = "CE" if ot_raw in ("CE", "C") else ("PE" if ot_raw in ("PE","P") else None)
 
-    # fallback: if we couldn't find strike+OT in one go, try to detect OT then nearest number
     if strike is None:
         m_ot = re.search(r"\b(CE|PE|C|P)\b", s)
         if m_ot:
             ot_raw = m_ot.group(1)
             ot = "CE" if ot_raw in ("CE","C") else "PE"
-            # try last 5-6 digit number as strike
             m_num = re.findall(r"(\d{4,6})", s)
             if m_num:
                 strike = _human_strike(m_num[-1])
@@ -242,16 +242,10 @@ def load_scrip_master(force: bool = False) -> List[Dict[str, Any]]:
         name = str(row.get("name","")).strip().upper()
 
         # parse fields if not provided
-        expiry = _to_date_safe(row.get("expiry")) or _parse_symbol_fields(symbol)[0]
-        strike = None
-        if row.get("strike") not in (None, "", "NaN"):
-            strike = _human_strike(row.get("strike"))
-        if strike is None:
-            strike = _parse_symbol_fields(symbol)[1]
-        opt_type = None
-        if symbol.endswith(("CE","PE")) or re.search(r"\b(CE|PE|C|P)\b", symbol):
-            ot = _parse_symbol_fields(symbol)[2]
-            opt_type = ot
+        ps_exp, ps_strike, ps_ot = _parse_symbol_fields(symbol)
+        expiry = _to_date_safe(row.get("expiry")) or ps_exp
+        strike = _human_strike(row.get("strike")) if row.get("strike") not in (None, "", "NaN") else ps_strike
+        opt_type = ps_ot
 
         token = row.get("token")
         if token in (None, "", "NaN"):
@@ -281,14 +275,10 @@ def list_expiries(index_name: str, instrumenttype: str = "OPTIDX") -> List[str]:
     for r in rows:
         if r.get("exch_seg") != "NFO":
             continue
-        # be lenient: instrumenttype startswith 'OPT' if exact doesn't match
         inst_ok = (r.get("instrumenttype") == inst) or (inst.startswith("OPT") and str(r.get("instrumenttype","")).startswith("OPT"))
         if not inst_ok:
             continue
-        # match by 'name' OR symbol prefix
-        name_ok = (r.get("name") == idx)
-        sym_ok = str(r.get("symbol","")).startswith(idx)
-        if not (name_ok or sym_ok):
+        if not (r.get("name") == idx or str(r.get("symbol","")).startswith(idx)):
             continue
 
         exp = r.get("expiry")
@@ -381,13 +371,12 @@ def _rest_quote_ltp_nse(tokens: List[str]) -> Optional[float]:
         return None
     return None
 
-# ---------- Chain builder ----------
-def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "OPTIDX", half_width: int = 10) -> Dict[str, Any]:
+# ---------- Chain builder (defaults to ±20 strikes) ----------
+def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "OPTIDX", half_width: int = 20) -> Dict[str, Any]:
     expiry_date = _parse_expiry(expiry_str)
     idx = index_name.upper()
     inst = instrumenttype.upper()
 
-    # collect relevant rows (lenient matching & symbol parsing fallback)
     rows_all = []
     for r in load_scrip_master():
         if r.get("exch_seg") != "NFO":
@@ -398,7 +387,6 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
         if not (r.get("name") == idx or str(r.get("symbol","")).startswith(idx)):
             continue
 
-        # ensure expiry present
         exp = r.get("expiry")
         if not isinstance(exp, dt.date):
             exp = _parse_symbol_fields(r.get("symbol",""))[0]
@@ -406,12 +394,13 @@ def build_option_chain(index_name: str, expiry_str: str, instrumenttype: str = "
             continue
 
         opt_type = r.get("option_type")
-        if opt_type not in ("CE","PE"):
-            # try parse again if missing
-            opt_type = _parse_symbol_fields(r.get("symbol",""))[2]
         strike = r.get("strike")
-        if strike is None:
-            strike = _parse_symbol_fields(r.get("symbol",""))[1]
+
+        if opt_type not in ("CE","PE") or strike is None:
+            # try to parse from symbol if missing
+            ps_exp, ps_strike, ps_ot = _parse_symbol_fields(r.get("symbol",""))
+            opt_type = opt_type or ps_ot
+            strike = strike if strike is not None else ps_strike
 
         if opt_type not in ("CE","PE") or strike is None:
             continue
@@ -551,7 +540,7 @@ def http_chain():
     symbol = request.args.get("symbol")
     expiry = request.args.get("expiry")
     it = request.args.get("instrumenttype", "OPTIDX")
-    width = request.args.get("width", type=int, default=10)
+    width = request.args.get("width", type=int, default=20)  # ATM ±20 by default
     if not symbol or not expiry:
         return jsonify({"success": False, "error": "query params 'symbol' and 'expiry' are required (expiry as DDMMMYYYY)"}), 400
     try:

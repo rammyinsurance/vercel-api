@@ -4,3 +4,7 @@ urllib3==2.2.2
 certifi==2024.7.4
 python-dateutil==2.9.0.post0
 Gunicorn
+flask-cors==4.0.1
+pyotp==2.9.0
+smartapi-python==1.4.8
+logzero==1.7.0

@@ -9,3 +9,12 @@ pyotp==2.9.0
 smartapi-python==1.4.8
 logzero==1.7.0
 websocket-client==1.8.0
+# --- Google OAuth token verification ---
+google-auth
+google-auth-oauthlib   # optional, but useful if you ever do OAuth flows
+
+# --- JWT for session tokens ---
+PyJWT
+
+# --- Env file support ---
+python-dotenv

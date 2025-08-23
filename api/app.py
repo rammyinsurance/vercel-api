@@ -741,6 +741,135 @@ def get_spot_price(symbol: str) -> Optional[float]:
         pass
 
     return None
+# --- helpers to safely pick numeric fields from Angel responses
+def _fnum_safe(*vals):
+    for v in vals:
+        try:
+            if v is None:
+                continue
+            return float(v)
+        except Exception:
+            continue
+    return None
+
+def _parse_prev_close_from_row(row: Dict[str, Any]) -> Optional[float]:
+    # Angel changes field names across endpoints/objects; try many
+    return _fnum_safe(
+        row.get("close"),
+        row.get("previousClose"),
+        row.get("prevClose"),
+        row.get("pClose"),
+        row.get("pc"),
+        row.get("closePrice"),
+    )
+
+def _parse_change_pct_from_row(row: Dict[str, Any]) -> Optional[float]:
+    # Some payloads include percent directly
+    return _fnum_safe(
+        row.get("percentChange"),
+        row.get("pChange"),
+        row.get("cp"),
+        row.get("change_percent"),
+    )
+
+def _rest_quote_detail_nse(tokens: List[str]) -> Optional[Dict[str, float]]:
+    """
+    Use REST quote in FULL mode to fetch LTP & previous close for NSE indices.
+    Returns: {'ltp': float, 'prev_close': float} if available.
+    """
+    login()
+    if not tokens:
+        return None
+    url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote"
+    payload = {"mode": "FULL", "exchangeTokens": {"NSE": [str(t) for t in tokens]}}
+    try:
+        r = requests.post(url, headers=_headers_marketdata(), data=json.dumps(payload), timeout=15)
+        j = r.json() or {}
+        data = j.get("data")
+        fetched = (data.get("fetched") if isinstance(data, dict) else data) or []
+        if isinstance(fetched, list) and fetched:
+            row = fetched[0] or {}
+            # ltp fields
+            ltp = _fnum_safe(row.get("ltp"), row.get("lastTradedPrice"), row.get("lastPrice"))
+            # previous close appears under different keys on different payloads
+            prev = _fnum_safe(
+                row.get("close"),            # common key in FULL
+                row.get("previousClose"),
+                row.get("prevClose"),
+                row.get("pClose"),
+                row.get("closePrice"),
+            )
+            out: Dict[str, float] = {}
+            if ltp is not None: out["ltp"] = float(ltp)
+            if prev is not None: out["prev_close"] = float(prev)
+            return out if out else None
+    except Exception:
+        pass
+    return None
+def _sdk_quote_detail_nse(token: str) -> Optional[Dict[str, float]]:
+    """
+    Fallback via SDK getMarketData('FULL') for NSE token.
+    Attempts to read ltp + previous close.
+    """
+    try:
+        sc = login()
+        res = sc.getMarketData("FULL", {"NSE": [str(token)]}) or {}
+        data = res.get("data") or {}
+        fetched = data.get("fetched") or []
+        if isinstance(fetched, list) and fetched:
+            row = fetched[0] or {}
+            ltp = _fnum_safe(row.get("ltp"), row.get("lastTradedPrice"), row.get("lastPrice"))
+            prev = _fnum_safe(
+                row.get("close"), row.get("previousClose"), row.get("prevClose"), row.get("closePrice")
+            )
+            out: Dict[str, float] = {}
+            if ltp is not None: out["ltp"] = float(ltp)
+            if prev is not None: out["prev_close"] = float(prev)
+            return out if out else None
+    except Exception:
+        pass
+    return None
+
+
+def get_spot_detail(symbol: str) -> Dict[str, Optional[float]]:
+    """
+    Returns: {spot, prev_close, change, change_pct} for indices.
+    - For NSE indices (token known): try REST FULL first, then SDK FULL.
+    - For BSE indices: spot via options-underlying; prev_close may be None.
+    """
+    sym = _norm_str(symbol)
+
+    # Start with our general spot (options-underlying aggregation / REST LTP)
+    spot = get_spot_price(sym)
+    prev_close = None
+
+    tok = INDEX_TOKENS.get(sym)
+    if tok:
+        # 1) REST FULL (preferred)
+        det = _rest_quote_detail_nse([str(tok)])
+        # 2) SDK FULL fallback
+        if not det:
+            det = _sdk_quote_detail_nse(str(tok))
+        if det:
+            if det.get("ltp") is not None:
+                spot = det["ltp"]
+            if det.get("prev_close") is not None:
+                prev_close = det["prev_close"]
+
+    change = None
+    change_pct = None
+    if spot is not None and prev_close is not None and prev_close != 0:
+        change = float(spot) - float(prev_close)
+        change_pct = (change / float(prev_close)) * 100.0
+
+    return {
+        "spot": float(spot) if spot is not None else None,
+        "prev_close": float(prev_close) if prev_close is not None else None,
+        "change": float(change) if change is not None else None,
+        "change_pct": float(change_pct) if change_pct is not None else None,
+    }
+
+
 
 # -------- HTTP --------
 # ---------- HTTP ----------
@@ -752,6 +881,17 @@ def home():
 def health():
     rows = load_scrip_master()
     return jsonify({"status":"ok","rows_cached":len(rows)}), 200
+
+@app.route("/spot_detail", methods=["GET"])
+def http_spot_detail():
+    symbol = request.args.get("symbol")
+    if not symbol:
+        return jsonify({"success": False, "error": "query param 'symbol' required"}), 400
+    try:
+        d = get_spot_detail(symbol)
+        return jsonify({"success": True, "symbol": _norm_str(symbol), **d})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/expiry_dates/<index>", methods=["GET"])
 def http_expiries(index):
@@ -818,4 +958,3 @@ def http_spot():
         return jsonify({"success": True, "symbol": _norm_str(symbol), "spot": float(spot) if spot is not None else None})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-

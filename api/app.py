@@ -14,6 +14,7 @@ from SmartApi import SmartConnect
 
 import functools
 import jwt
+import uuid
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 from dotenv import load_dotenv
@@ -45,7 +46,7 @@ ALLOWLIST_EMAILS = [
     if e.strip()
 ]
 SESSION_JWT_SECRET = os.getenv("SESSION_JWT_SECRET", "").strip()
-FRONTEND_ORIGINS_ENV = os.getenv("FRONTEND_ORIGINS") or "http://localhost:5173,http://localhost:3000,https://quantse-ui.vercel.app"
+FRONTEND_ORIGINS_ENV = os.getenv("FRONTEND_ORIGINS") or "http://localhost:5173,http://localhost:3000,https://quantse-ui.vercel.app,http://127.0.0.1:5173"
 FRONTEND_ORIGINS: Iterable[str] = [o.strip() for o in FRONTEND_ORIGINS_ENV.split(",") if o.strip()]
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -115,53 +116,71 @@ _scrip_time: Optional[dt.datetime] = None
 # =========================
 # Helpers
 # =========================
+# =========================
+# Single-session registry (in-memory)
+# For production, replace with Redis.
+# =========================
+CURRENT_SESSION_BY_EMAIL: dict[str, str] = {}
+SESSION_TTL_SECONDS = 2 * 60 * 60  # 2h (align with your client expectations)
+
+# =========================
+# Helpers
+# =========================
+# --- replace GOOGLE_CLIENT_ID with a LIST ---
+CLIENT_IDS = [c.strip() for c in (os.getenv("VITE_GOOGLE_CLIENT_ID") or "").split(",") if c.strip()]
+if not CLIENT_IDS:
+    raise RuntimeError("VITE_GOOGLE_CLIENT_ID is not set in .env")
+
+print("SERVER GOOGLE_CLIENT_ID(S):", CLIENT_IDS)
+
 def _verify_google_id_token(raw_token: str) -> dict:
     """
-    Verify a Google ID token and return its payload (dict).
-    Raises Exception if invalid.
+    Verify the Google ID token against any of the allowed CLIENT_IDS.
+    Raises with the original reason so we can see 'Wrong recipient' etc.
     """
-    ticket = id_token.verify_oauth2_token(raw_token, grequests.Request(), GOOGLE_CLIENT_ID)
-    if not ticket:
-        raise ValueError("Invalid Google token")
-    return ticket
+    last_err = None
+    for aud in CLIENT_IDS:
+        try:
+            return id_token.verify_oauth2_token(raw_token, grequests.Request(), aud)
+        except Exception as e:
+            last_err = e
+            continue
+    # re-raise the last error for visibility
+    raise last_err or ValueError("Invalid Google token")
 
 
 def _email_allowed(email: str) -> bool:
     email = (email or "").lower()
     return not ALLOWLIST_EMAILS or email in ALLOWLIST_EMAILS
 
-
 def _mint_session(payload: dict) -> str | None:
-    """
-    Create a short-lived application session JWT from Google payload.
-    Return None if SESSION_JWT_SECRET not set.
-    """
     if not SESSION_JWT_SECRET:
         return None
+    jti = str(uuid.uuid4())  # <-- works now
+    email = (payload.get("email") or "").lower()
     claims = {
+        "jti": jti,
         "sub": payload.get("sub"),
-        "email": payload.get("email"),
+        "email": email,
         "name": payload.get("name"),
         "picture": payload.get("picture"),
-        # You can add roles/permissions here if needed
     }
-    return jwt.encode(claims, SESSION_JWT_SECRET, algorithm="HS256")
+    token = jwt.encode(claims, SESSION_JWT_SECRET, algorithm="HS256")
+    CURRENT_SESSION_BY_EMAIL[email] = jti
+    return token
 
 
 def _verify_session(session_token: str) -> dict:
-    """
-    Verify an application session JWT (minted by our /auth/verify-google endpoint).
-    Raises Exception if invalid.
-    """
-    return jwt.decode(session_token, SESSION_JWT_SECRET, algorithms=["HS256"])
-
+    payload = jwt.decode(session_token, SESSION_JWT_SECRET, algorithms=["HS256"])
+    email = (payload.get("email") or "").lower()
+    jti = payload.get("jti")
+    if not jti or CURRENT_SESSION_BY_EMAIL.get(email) != jti:
+        raise ValueError("Session superseded")
+    return payload
 
 def _get_bearer_token() -> str | None:
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:]
-    return None
-
+    return auth[7:] if auth.startswith("Bearer ") else None
 
 # -------- Helpers --------
 def _sanitize_totp(raw: str) -> str:
@@ -959,45 +978,53 @@ def get_spot_detail(symbol: str) -> Dict[str, Optional[float]]:
 # =========================
 # Auth endpoints
 # =========================
+# =========================
+# Auth endpoints
+# =========================
 @app.post("/verify-google")
 def verify_google():
-    """
-    Frontend sends Google ID token in Authorization: Bearer <idToken>.
-    Backend verifies token + allowlist and (optionally) returns a session JWT.
-    """
     token = _get_bearer_token()
     if not token:
         return jsonify({"error": "Missing token"}), 401
     try:
         payload = _verify_google_id_token(token)
+        print('payload',payload)
         email = (payload.get("email") or "").lower()
         if not _email_allowed(email):
             return jsonify({"error": "Email not allowed"}), 403
-
-        session = _mint_session(payload)  # may be None if SESSION_JWT_SECRET not set
+        session = _mint_session(payload)
         return jsonify({"ok": True, "email": email, "session": session}), 200
     except Exception as e:
-        # print(e)  # uncomment for debugging
-        return jsonify({"error": "Invalid token"}), 401
+        # SHOW the actual reason (Wrong recipient, Expired, etc.)
+        return jsonify({"error": "Invalid token", "detail": str(e)}), 401
 
+
+@app.post("/logout")
+def logout():
+    token = _get_bearer_token()
+    if not token or not SESSION_JWT_SECRET:
+        return jsonify({"ok": True})  # nothing to do
+    try:
+        payload = jwt.decode(token, SESSION_JWT_SECRET, algorithms=["HS256"])
+        email = (payload.get("email") or "").lower()
+        jti = payload.get("jti")
+        curr = CURRENT_SESSION_BY_EMAIL.get(email)
+        if curr and jti and curr == jti:
+            CURRENT_SESSION_BY_EMAIL.pop(email, None)
+    except Exception:
+        pass
+    return jsonify({"ok": True})
 
 # =========================
-# Route protection decorator
+# Auth decorator
 # =========================
 def auth_required(fn: Callable):
-    """
-    Protect routes with either:
-      - our app session JWT (Authorization: Bearer <session>)
-      - OR a raw Google ID token (Authorization: Bearer <google_id_token>)
-    We prefer session JWT if SESSION_JWT_SECRET is configured.
-    """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         token = _get_bearer_token()
         if not token:
             return jsonify({"error": "Unauthorized"}), 401
 
-        # Try app session first (if enabled)
         if SESSION_JWT_SECRET:
             try:
                 session_payload = _verify_session(token)
@@ -1006,11 +1033,12 @@ def auth_required(fn: Callable):
                     return jsonify({"error": "Email not allowed"}), 403
                 request.user = session_payload  # type: ignore[attr-defined]
                 return fn(*args, **kwargs)
+            except ValueError as e:
+                if str(e) == "Session superseded":
+                    return jsonify({"error": "Session superseded"}), 401
             except Exception:
-                # Fall through to try Google token next
-                pass
+                pass  # fall through
 
-        # Fallback: accept a valid Google ID token directly
         try:
             payload = _verify_google_id_token(token)
             email = (payload.get("email") or "").lower()
@@ -1020,9 +1048,12 @@ def auth_required(fn: Callable):
             return fn(*args, **kwargs)
         except Exception:
             return jsonify({"error": "Unauthorized"}), 401
-
     return wrapper
 
+# =========================
+# Example protected Angel API routes
+# Replace bodies with your SmartApi calls
+# =========================
 # ---------- HTTP ----------
 @app.get("/")
 def home():

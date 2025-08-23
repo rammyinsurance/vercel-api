@@ -4,13 +4,20 @@ import base64
 import datetime as dt
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Iterable
 
 import pyotp
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from SmartApi import SmartConnect
+
+import functools
+import jwt
+from google.oauth2 import id_token
+from google.auth.transport import requests as grequests
+from dotenv import load_dotenv
+
 
 # --- make logging writable in serverless (SmartApi uses logzero -> 'logs/' relative path) ---
 try:
@@ -24,6 +31,27 @@ try:
 except Exception:
     pass
 # ----
+
+# =========================
+# Load environment (.env)
+# =========================
+# Loads variables from a .env file into process env
+load_dotenv()
+
+GOOGLE_CLIENT_ID = os.getenv("VITE_GOOGLE_CLIENT_ID", "").strip()
+ALLOWLIST_EMAILS = [
+    e.strip().lower()
+    for e in (os.getenv("ALLOWLIST_EMAILS") or "").split(",")
+    if e.strip()
+]
+SESSION_JWT_SECRET = os.getenv("SESSION_JWT_SECRET", "").strip()
+FRONTEND_ORIGINS_ENV = os.getenv("FRONTEND_ORIGINS") or "http://localhost:5173,http://localhost:3000,https://quantse-ui.vercel.app"
+FRONTEND_ORIGINS: Iterable[str] = [o.strip() for o in FRONTEND_ORIGINS_ENV.split(",") if o.strip()]
+PORT = int(os.getenv("PORT", "8000"))
+
+if not GOOGLE_CLIENT_ID:
+    raise RuntimeError("VITE_GOOGLE_CLIENT_ID is not set in .env")
+
 
 # ================== CONFIG ==================
 API_KEY = "16l7qomQ"
@@ -69,7 +97,9 @@ NAME_ALIASES = {
 SUPPORTED_INDICES = set(list(INDEX_TOKENS.keys()) + ["SENSEX", "BANKEX"])
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"])
+#CORS(app, resources={r"/*": {"origins": "*"}}, methods=["GET", "POST", "OPTIONS"])
+CORS(app, resources={r"/*": {"origins": list(FRONTEND_ORIGINS)}}, supports_credentials=True, methods=["GET", "POST", "OPTIONS"])
+
 
 # -------- Session / cache --------
 _sc: Optional[SmartConnect] = None
@@ -79,6 +109,59 @@ _feed_token: Optional[str] = None
 
 _scrip_cache: Optional[List[Dict[str, Any]]] = None
 _scrip_time: Optional[dt.datetime] = None
+
+
+
+# =========================
+# Helpers
+# =========================
+def _verify_google_id_token(raw_token: str) -> dict:
+    """
+    Verify a Google ID token and return its payload (dict).
+    Raises Exception if invalid.
+    """
+    ticket = id_token.verify_oauth2_token(raw_token, grequests.Request(), GOOGLE_CLIENT_ID)
+    if not ticket:
+        raise ValueError("Invalid Google token")
+    return ticket
+
+
+def _email_allowed(email: str) -> bool:
+    email = (email or "").lower()
+    return not ALLOWLIST_EMAILS or email in ALLOWLIST_EMAILS
+
+
+def _mint_session(payload: dict) -> str | None:
+    """
+    Create a short-lived application session JWT from Google payload.
+    Return None if SESSION_JWT_SECRET not set.
+    """
+    if not SESSION_JWT_SECRET:
+        return None
+    claims = {
+        "sub": payload.get("sub"),
+        "email": payload.get("email"),
+        "name": payload.get("name"),
+        "picture": payload.get("picture"),
+        # You can add roles/permissions here if needed
+    }
+    return jwt.encode(claims, SESSION_JWT_SECRET, algorithm="HS256")
+
+
+def _verify_session(session_token: str) -> dict:
+    """
+    Verify an application session JWT (minted by our /auth/verify-google endpoint).
+    Raises Exception if invalid.
+    """
+    return jwt.decode(session_token, SESSION_JWT_SECRET, algorithms=["HS256"])
+
+
+def _get_bearer_token() -> str | None:
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
+
 
 # -------- Helpers --------
 def _sanitize_totp(raw: str) -> str:
@@ -872,6 +955,74 @@ def get_spot_detail(symbol: str) -> Dict[str, Optional[float]]:
 
 
 # -------- HTTP --------
+
+# =========================
+# Auth endpoints
+# =========================
+@app.post("/verify-google")
+def verify_google():
+    """
+    Frontend sends Google ID token in Authorization: Bearer <idToken>.
+    Backend verifies token + allowlist and (optionally) returns a session JWT.
+    """
+    token = _get_bearer_token()
+    if not token:
+        return jsonify({"error": "Missing token"}), 401
+    try:
+        payload = _verify_google_id_token(token)
+        email = (payload.get("email") or "").lower()
+        if not _email_allowed(email):
+            return jsonify({"error": "Email not allowed"}), 403
+
+        session = _mint_session(payload)  # may be None if SESSION_JWT_SECRET not set
+        return jsonify({"ok": True, "email": email, "session": session}), 200
+    except Exception as e:
+        # print(e)  # uncomment for debugging
+        return jsonify({"error": "Invalid token"}), 401
+
+
+# =========================
+# Route protection decorator
+# =========================
+def auth_required(fn: Callable):
+    """
+    Protect routes with either:
+      - our app session JWT (Authorization: Bearer <session>)
+      - OR a raw Google ID token (Authorization: Bearer <google_id_token>)
+    We prefer session JWT if SESSION_JWT_SECRET is configured.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = _get_bearer_token()
+        if not token:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # Try app session first (if enabled)
+        if SESSION_JWT_SECRET:
+            try:
+                session_payload = _verify_session(token)
+                email = (session_payload.get("email") or "").lower()
+                if not _email_allowed(email):
+                    return jsonify({"error": "Email not allowed"}), 403
+                request.user = session_payload  # type: ignore[attr-defined]
+                return fn(*args, **kwargs)
+            except Exception:
+                # Fall through to try Google token next
+                pass
+
+        # Fallback: accept a valid Google ID token directly
+        try:
+            payload = _verify_google_id_token(token)
+            email = (payload.get("email") or "").lower()
+            if not _email_allowed(email):
+                return jsonify({"error": "Email not allowed"}), 403
+            request.user = payload  # type: ignore[attr-defined]
+            return fn(*args, **kwargs)
+        except Exception:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    return wrapper
+
 # ---------- HTTP ----------
 @app.get("/")
 def home():
@@ -958,3 +1109,4 @@ def http_spot():
         return jsonify({"success": True, "symbol": _norm_str(symbol), "spot": float(spot) if spot is not None else None})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
